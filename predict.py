@@ -5,10 +5,7 @@ import pandas as pd
 from catboost import CatBoostRegressor
 
 HERE = Path(__file__).resolve().parent
-TRAIN_PATH = HERE / "train.csv"
 MODEL_PATH = HERE / "model.cbm"
-
-LABEL_COLS = ["hours_spent", "log_hours", "hours_bucket"]
 MAX_HOURS = 140.7
 
 PRIOR_MAP = {"0": 0, "1-2": 1, "3-5": 2, "6+": 3}
@@ -23,15 +20,6 @@ BOOL_COLS = [
     "is_multiplayer", "mentions_ai_api", "is_clone_or_tutorial", "is_forked_from_template",
 ]
 
-PARAMS = dict(
-    iterations=2130,
-    learning_rate=0.03,
-    depth=8,
-    l2_leaf_reg=5,
-    rsm=0.5,
-    random_seed=42,
-    verbose=0,
-)
 
 def clean(X):
     X = X.copy()
@@ -44,8 +32,10 @@ def clean(X):
         X[c] = X[c].fillna("missing").astype(str)
     return X
 
+
 def div(a, b):
     return a / b.replace(0, np.nan)
+
 
 def add_features(X):
     X = X.copy()
@@ -64,35 +54,19 @@ def add_features(X):
     X["loc_template_adj"] = np.log1p(X.lines_of_code) * (1 - 0.5 * X.is_forked_from_template.fillna(0))
     return X
 
-def prepare(df):
-    X = df.drop(columns=["project_id"] + LABEL_COLS, errors="ignore")
-    return add_features(clean(X))
 
-def train():
-    df = pd.read_csv(TRAIN_PATH)
-    X = prepare(df)
-    y_log = np.log1p(df["hours_spent"])
-    model = CatBoostRegressor(cat_features=CAT_COLS, **PARAMS)
-    model.fit(X, y_log)
-    model.save_model(str(MODEL_PATH))
-    return model
+def prepare(X):
+    return add_features(clean(X.drop(columns=["project_id"])))
 
-def load_model():
-    if MODEL_PATH.exists():
-        model = CatBoostRegressor()
-        model.load_model(str(MODEL_PATH))
-        return model
-    return train()
 
 def predict(test_path, out_path):
     test = pd.read_csv(test_path)
-    model = load_model()
+    model = CatBoostRegressor()
+    model.load_model(str(MODEL_PATH))
     X = prepare(test)[model.feature_names_]
-    hours = np.expm1(model.predict(X))
-    hours = np.clip(hours, 0, MAX_HOURS)
-    out = pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours})
-    out.to_csv(out_path, index=False)
-    print(f"wrote {len(out)} predictions to {out_path}")
+    hours = np.clip(np.expm1(model.predict(X)), 0, MAX_HOURS)
+    pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours}).to_csv(out_path, index=False)
+
 
 if __name__ == "__main__":
-    predict("test.csv", "predictions.csv")
+    predict(HERE / "test.csv", HERE / "predictions.csv")
