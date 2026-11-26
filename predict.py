@@ -57,10 +57,9 @@ def add_features(X):
 def prepare(X):
     return add_features(clean(X.drop(columns=["project_id"])))
 
-MODEL_DIR = HERE / "models"
-MODEL_PATHS = sorted(MODEL_DIR.glob("model_*.cbm"))
+MODEL_PATHS = sorted(HERE.glob("model_*.cbm"))
 if not MODEL_PATHS:
-    raise FileNotFoundError(f"No models found in {MODEL_DIR}")
+    raise FileNotFoundError(f"No model_*.cbm in {HERE}; found: {sorted(p.name for p in HERE.iterdir())}")
 
 def predict(test_path, out_path):
     test = pd.read_csv(test_path)
@@ -74,4 +73,4 @@ def predict(test_path, out_path):
     pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours}).to_csv(out_path, index=False)
 
 if __name__ == "__main__":
-    predict(HERE / "train.csv", HERE / "predictions.csv")
+    predict(HERE / "test.csv", HERE / "predictions.csv")
