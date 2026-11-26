@@ -5,6 +5,7 @@ import pandas as pd
 from catboost import CatBoostRegressor
 
 HERE = Path(__file__).resolve().parent
+MODEL_PATH = HERE / "model.cbm"
 MAX_HOURS = 140.7
 
 PRIOR_MAP = {"0": 0, "1-2": 1, "3-5": 2, "6+": 3}
@@ -57,20 +58,15 @@ def add_features(X):
 def prepare(X):
     return add_features(clean(X.drop(columns=["project_id"])))
 
-MODEL_PATHS = sorted(HERE.glob("model_*.cbm"))
-if not MODEL_PATHS:
-    raise FileNotFoundError(f"No model_*.cbm in {HERE}; found: {sorted(p.name for p in HERE.iterdir())}")
 
 def predict(test_path, out_path):
     test = pd.read_csv(test_path)
-    X_all = prepare(test)
-    preds = []
-    for p in MODEL_PATHS:
-        m = CatBoostRegressor()
-        m.load_model(str(p))
-        preds.append(m.predict(X_all[m.feature_names_]))
-    hours = np.clip(np.expm1(np.mean(preds, axis=0)), 0, MAX_HOURS)
+    model = CatBoostRegressor()
+    model.load_model(str(MODEL_PATH))
+    X = prepare(test)[model.feature_names_]
+    hours = np.clip(np.expm1(model.predict(X)), 0, MAX_HOURS)
     pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours}).to_csv(out_path, index=False)
+
 
 if __name__ == "__main__":
     predict(HERE / "test.csv", HERE / "predictions.csv")
