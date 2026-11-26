@@ -5,7 +5,6 @@ import pandas as pd
 from catboost import CatBoostRegressor
 
 HERE = Path(__file__).resolve().parent
-MODEL_PATH = HERE / "model.cbm"
 MAX_HOURS = 140.7
 
 PRIOR_MAP = {"0": 0, "1-2": 1, "3-5": 2, "6+": 3}
@@ -58,7 +57,10 @@ def add_features(X):
 def prepare(X):
     return add_features(clean(X.drop(columns=["project_id"])))
 
-MODEL_PATHS = sorted(HERE.glob("model_*.cbm"))
+MODEL_DIR = HERE / "models"
+MODEL_PATHS = sorted(MODEL_DIR.glob("model_*.cbm"))
+if not MODEL_PATHS:
+    raise FileNotFoundError(f"No models found in {MODEL_DIR}")
 
 def predict(test_path, out_path):
     test = pd.read_csv(test_path)
@@ -72,4 +74,4 @@ def predict(test_path, out_path):
     pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours}).to_csv(out_path, index=False)
 
 if __name__ == "__main__":
-    predict(HERE / "test.csv", HERE / "predictions.csv")
+    predict(HERE / "train.csv", HERE / "predictions.csv")
