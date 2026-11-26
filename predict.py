@@ -52,6 +52,11 @@ def add_features(X):
     X["readme_richness"] = X[["readme_num_headings", "readme_num_images", "readme_num_code_blocks"]].sum(axis=1, min_count=1)
     X["loc_x_days"] = np.log1p(X.lines_of_code) * np.log1p(X.active_commit_days)
     X["loc_template_adj"] = np.log1p(X.lines_of_code) * (1 - 0.5 * X.is_forked_from_template.fillna(0))
+    X["log_code_velocity"] = np.log1p(divide(X["lines_added_total"], X["active_commit_days"]))
+    X["loc_per_file"] = np.log1p(divide(X["lines_of_code"], X["num_source_files"]))
+    X["density_active_days"] = divide(X["active_commit_days"], X["project_span_days"] + 1)
+    X["log_commits_intensity"] = np.log1p(divide(X["num_commits"], X["project_span_days"] + 1))
+    X["non_code_file_ratio"] = divide(X["n_assets"], X["num_source_files"] + X["n_assets"] + 1)
     return X
 
 
