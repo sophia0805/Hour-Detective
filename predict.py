@@ -4,6 +4,11 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor
 
+import json
+import lightgbm as lgb
+from xgboost import XGBRegressor
+
+
 HERE = Path(__file__).resolve().parent
 MODEL_PATH = HERE / "model.cbm"
 MAX_HOURS = 140.7
@@ -20,6 +25,7 @@ BOOL_COLS = [
     "is_multiplayer", "mentions_ai_api", "is_clone_or_tutorial", "is_forked_from_template",
 ]
 
+META = json.loads((HERE / "blend.json").read_text())\
 
 def clean(X):
     X = X.copy()
@@ -39,39 +45,71 @@ def div(a, b):
 
 def add_features(X):
     X = X.copy()
+
     X["lines_per_active_day"] = div(X.lines_added_total, X.active_commit_days)
     X["loc_per_commit"] = div(X.lines_of_code, X.num_commits)
     X["commits_per_active_day"] = div(X.num_commits, X.active_commit_days)
     X["active_frac"] = div(X.active_commit_days, X.project_span_days + 1)
     X["total_lines_touched"] = np.log1p(X.lines_added_total + X.lines_deleted_total)
     X["biggest_commit_share"] = div(X.max_lines_in_one_commit, X.lines_added_total)
-    X["bulk_upload"] = (X.pct_code_in_first_commit > 0.8).astype(float).where(X.pct_code_in_first_commit.notna())
+    X["n_assets"] = X[[
+        "num_image_files", "num_audio_files", "num_3d_model_files", "num_font_files"
+    ]].sum(axis=1, min_count=1)
+    X["readme_richness"] = X[[
+        "readme_num_headings", "readme_num_images", "readme_num_code_blocks"
+    ]].sum(axis=1, min_count=1)
+    X["loc_x_days"] = np.log1p(X.lines_of_code) * np.log1p(X.active_commit_days)
+    X["loc_template_adj"] = (
+        np.log1p(X.lines_of_code)
+        * (1 - 0.5 * X.is_forked_from_template.fillna(0))
+    )
+    X["loc_template_adj"] = np.log1p(X.lines_of_code) * (1 - 0.5 * X.is_forked_from_template.fillna(0))
+    X["log_code_velocity"] = np.log1p(div(X["lines_added_total"], X["active_commit_days"]))
+    X["loc_per_file"] = np.log1p(div(X["lines_of_code"], X["num_source_files"]))
+    X["density_active_days"] = div(X["active_commit_days"], X["project_span_days"] + 1)
+    X["log_commits_intensity"] = np.log1p(div(X["num_commits"], X["project_span_days"] + 1))
+    X["non_code_file_ratio"] = div(X["n_assets"], X["num_source_files"] + X["n_assets"] + 1)
+
+    X["bulk_upload"] = (X.pct_code_in_first_commit > 0.8).astype(float).where(
+        X.pct_code_in_first_commit.notna()
+    )
     X["few_commits"] = (X.num_commits <= 3).astype(float).where(X.num_commits.notna())
     X["no_git"] = X.num_commits.isna().astype(float)
-    X["n_assets"] = X[["num_image_files", "num_audio_files", "num_3d_model_files", "num_font_files"]].sum(axis=1, min_count=1)
-    X["readme_richness"] = X[["readme_num_headings", "readme_num_images", "readme_num_code_blocks"]].sum(axis=1, min_count=1)
-    X["loc_x_days"] = np.log1p(X.lines_of_code) * np.log1p(X.active_commit_days)
-    X["loc_template_adj"] = np.log1p(X.lines_of_code) * (1 - 0.5 * X.is_forked_from_template.fillna(0))
-    X["log_code_velocity"] = np.log1p(divide(X["lines_added_total"], X["active_commit_days"]))
-    X["loc_per_file"] = np.log1p(divide(X["lines_of_code"], X["num_source_files"]))
-    X["density_active_days"] = divide(X["active_commit_days"], X["project_span_days"] + 1)
-    X["log_commits_intensity"] = np.log1p(divide(X["num_commits"], X["project_span_days"] + 1))
-    X["non_code_file_ratio"] = divide(X["n_assets"], X["num_source_files"] + X["n_assets"] + 1)
     return X
 
 
 def prepare(X):
     return add_features(clean(X.drop(columns=["project_id"])))
 
-
 def predict(test_path, out_path):
     test = pd.read_csv(test_path)
-    model = CatBoostRegressor()
-    model.load_model(str(MODEL_PATH))
-    X = prepare(test)[model.feature_names_]
-    hours = np.clip(np.expm1(model.predict(X)), 0, MAX_HOURS)
+    Xf = prepare(test)[META["base_columns"]]
+    w = META["weights"]
+
+    cat = CatBoostRegressor()
+    cat.load_model(str(HERE / "model.cbm"))
+    p_cat = cat.predict(Xf[cat.feature_names_])
+
+    X_lgb = Xf.copy()
+    for c in CAT_COLS:
+        X_lgb[c] = X_lgb[c].astype("category")
+    booster = lgb.Booster(model_file=str(HERE / "model_lgb.txt"))
+    p_lgb = booster.predict(X_lgb)
+
+    X_ohe = pd.get_dummies(Xf, columns=CAT_COLS, dtype=float)
+    X_ohe = X_ohe.reindex(columns=META["ohe_columns"], fill_value=0.0)
+    xgb_m = XGBRegressor()
+    xgb_m.load_model(str(HERE / "model_xgb.json"))
+    p_xgb = xgb_m.predict(X_ohe)
+
+    X_lin = X_ohe.copy()
+    r = META["ridge"]
+    p_ridge = ((X_lin.values - np.array(r["mean"])) / np.array(r["scale"])) @ np.array(r["coef"]) + r["intercept"]
+
+    log_pred = w["cat"] * p_cat + w["lgb"] * p_lgb + w["xgb"] * p_xgb + w["ridge"] * p_ridge
+    hours = np.clip(np.expm1(log_pred), 0, MAX_HOURS)
     pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours}).to_csv(out_path, index=False)
 
 
 if __name__ == "__main__":
-    predict(HERE / "test.csv", HERE / "predictions.csv")
+    predict(HERE / "train.csv", HERE / "predictions.csv")
