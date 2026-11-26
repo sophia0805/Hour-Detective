@@ -112,4 +112,4 @@ def predict(test_path, out_path):
 
 
 if __name__ == "__main__":
-    predict(HERE / "train.csv", HERE / "predictions.csv")
+    predict(HERE / "test.csv", HERE / "predictions.csv")
