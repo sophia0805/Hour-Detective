@@ -5,7 +5,7 @@ import pandas as pd
 from catboost import CatBoostRegressor
 
 HERE = Path(__file__).resolve().parent
-MODEL_PATH = HERE / "model.cbm"
+MODEL_DIR = HERE / "models"
 MAX_HOURS = 140.7
 
 PRIOR_MAP = {"0": 0, "1-2": 1, "3-5": 2, "6+": 3}
@@ -52,6 +52,16 @@ def add_features(X):
     X["readme_richness"] = X[["readme_num_headings", "readme_num_images", "readme_num_code_blocks"]].sum(axis=1, min_count=1)
     X["loc_x_days"] = np.log1p(X.lines_of_code) * np.log1p(X.active_commit_days)
     X["loc_template_adj"] = np.log1p(X.lines_of_code) * (1 - 0.5 * X.is_forked_from_template.fillna(0))
+
+    loc = np.log1p(X.lines_of_code)
+    first = X.pct_code_in_first_commit.fillna(0)
+    X["assets_per_kloc"] = np.log1p(X.n_assets.fillna(0)) - np.log1p(X.lines_of_code / 1000)
+    X["asset_mb_log"] = np.log1p(X.asset_size_mb)
+    X["dump_size"] = loc * first
+    X["written_loc"] = loc * (1 - first)
+    X["site_size"] = np.log1p(X.num_internal_pages) + np.log1p(X.page_weight_kb)
+    X["work_days_x_assets"] = np.log1p(X.active_commit_days) * np.log1p(X.n_assets.fillna(0))
+    X["span_weeks_active"] = np.log1p(X.project_span_days / 7) * X.active_frac.fillna(0)
     return X
 
 
@@ -59,14 +69,27 @@ def prepare(X):
     return add_features(clean(X.drop(columns=["project_id"])))
 
 
+def load_models():
+    paths = sorted(MODEL_DIR.glob("model_seed*.cbm"))
+    if not paths:
+        raise FileNotFoundError(f"no model_seed*.cbm files in {MODEL_DIR}")
+    models = []
+    for path in paths:
+        model = CatBoostRegressor()
+        model.load_model(str(path))
+        models.append(model)
+    return models
+
+
 def predict(test_path, out_path):
     test = pd.read_csv(test_path)
-    model = CatBoostRegressor()
-    model.load_model(str(MODEL_PATH))
-    X = prepare(test)[model.feature_names_]
-    hours = np.clip(np.expm1(model.predict(X)), 0, MAX_HOURS)
-    pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours}).to_csv(out_path, index=False)
+    X = prepare(test)
+    models = load_models()
 
+    log_pred = np.mean([m.predict(X[m.feature_names_]) for m in models], axis=0)
+    hours = np.clip(np.expm1(log_pred), 0, MAX_HOURS)
+
+    pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours}).to_csv(out_path, index=False)
 
 if __name__ == "__main__":
     predict(HERE / "test.csv", HERE / "predictions.csv")
