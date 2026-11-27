@@ -1,6 +1,6 @@
-import json
 from pathlib import Path
 
+import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -8,8 +8,7 @@ from catboost import CatBoostRegressor
 from xgboost import XGBRegressor
 
 HERE = Path(__file__).resolve().parent
-MAX_HOURS = 140.7
-META = json.loads((HERE / "blend.json").read_text())
+MODEL_DIR = HERE / "saved_models"
 
 PRIOR_MAP = {"0": 0, "1-2": 1, "3-5": 2, "6+": 3}
 AGE_MAP = {"<1": 0, "1-2": 1, "3-5": 2, "6+": 3}
@@ -32,6 +31,7 @@ BOOL_COLS = [
     "is_forked_from_template",
 ]
 
+TRAIN_COLS = ["project_id", "hours_spent", "log_hours", "hours_bucket"]
 
 def clean_features(X):
     X = X.copy()
@@ -52,7 +52,6 @@ def divide(numerator, denominator):
 
 def add_features(X):
     X = clean_features(X)
-    X = X.copy()
 
     X["lines_per_active_day"] = divide(X.lines_added_total, X.active_commit_days)
     X["loc_per_commit"] = divide(X.lines_of_code, X.num_commits)
@@ -79,46 +78,91 @@ def add_features(X):
 
     return X
 
+def load_models(model_dir=MODEL_DIR):
+    model_dir = Path(model_dir)
 
-def prepare(df):
-    return add_features(df.drop(columns=["project_id"]))[META["base_columns"]]
+    cb_model = CatBoostRegressor()
+    cb_model.load_model(str(model_dir / "catboost_model.cbm"))
 
-
-def predict(test_path, out_path):
-    test = pd.read_csv(test_path)
-    Xf = prepare(test)
-    w = META["weights"]
-
-    cat = CatBoostRegressor()
-    cat.load_model(str(HERE / "model.cbm"))
-    p_cat = cat.predict(Xf[cat.feature_names_])
-
-    X_lgb = Xf.copy()
-    for col in CAT_COLS:
-        X_lgb[col] = X_lgb[col].astype("category")
-    booster = lgb.Booster(model_file=str(HERE / "model_lgb.txt"))
-    p_lgb = booster.predict(X_lgb)
-
-    X_ohe = pd.get_dummies(Xf, columns=CAT_COLS, dtype=float)
-    X_ohe = X_ohe.reindex(columns=META["ohe_columns"], fill_value=0.0).fillna(0).astype(float)
+    lgb_model = lgb.Booster(model_file=str(model_dir / "lightgbm_model.txt"))
 
     xgb_model = XGBRegressor()
-    xgb_model.load_model(str(HERE / "model_xgb.json"))
-    p_xgb = xgb_model.predict(X_ohe)
+    xgb_model.load_model(str(model_dir / "xgboost_model.json"))
 
-    r = META["ridge"]
-    scaled = (X_ohe.values - np.array(r["mean"])) / np.array(r["scale"])
-    p_ridge = scaled @ np.array(r["coef"]) + r["intercept"]
+    scaler = joblib.load(model_dir / "ridge_scaler.pkl")
+    ridge = joblib.load(model_dir / "ridge_model.pkl")
+    weights = joblib.load(model_dir / "ensemble_weights.pkl")
 
-    preds = {"cat": p_cat, "lgb": p_lgb, "xgb": p_xgb, "ridge": p_ridge}
+    return {
+        "catboost": cb_model,
+        "lightgbm": lgb_model,
+        "xgboost": xgb_model,
+        "scaler": scaler,
+        "ridge": ridge,
+        "weights": weights,
+    }
+
+
+def ohe_columns(models):
+    scaler = models["scaler"]
+    if hasattr(scaler, "feature_names_in_"):
+        return list(scaler.feature_names_in_)
+    names = models["xgboost"].get_booster().feature_names
+    if names:
+        return list(names)
+    raise RuntimeError(
+        "Could not recover one-hot column order: fit the scaler on a DataFrame "
+        "or save X_ohe.columns alongside the models."
+    )
+
+def predict(X_raw, models=None):
+    if models is None:
+        models = load_models()
+
+    X_raw = X_raw.drop(columns=[c for c in TRAIN_COLS if c in X_raw.columns])
+
+    X_cleaned = add_features(X_raw)
+
+    cb_model = models["catboost"]
+    X_cb = X_cleaned[cb_model.feature_names_]
+
+    lgb_model = models["lightgbm"]
+    X_lgb = X_cleaned.copy()
+    for col in CAT_COLS:
+        X_lgb[col] = X_lgb[col].astype("category")
+    X_lgb = X_lgb[lgb_model.feature_name()]
+
+    X_ohe = pd.get_dummies(X_cleaned, columns=CAT_COLS, drop_first=True, dtype=float)
+    X_ohe = (
+        X_ohe.reindex(columns=ohe_columns(models), fill_value=0.0)
+        .fillna(0)
+        .astype(float)
+    )
+
+    preds = {
+        "catboost": cb_model.predict(X_cb),
+        "lightgbm": lgb_model.predict(X_lgb),
+        "xgboost": models["xgboost"].predict(X_ohe),
+        "ridge": models["ridge"].predict(models["scaler"].transform(X_ohe)),
+    }
     for name, p in preds.items():
         if not np.isfinite(p).all():
             raise ValueError(f"{name} produced NaN or inf predictions")
 
-    log_pred = sum(w[name] * preds[name] for name in preds)
-    hours = np.clip(np.expm1(log_pred), 0, MAX_HOURS)
-    pd.DataFrame({"project_id": test["project_id"], "hours_spent": hours}).to_csv(out_path, index=False)
+    weights = models["weights"]
+    final_log_pred = sum(weights[name] * preds[name] for name in preds)
+
+    return np.clip(np.expm1(final_log_pred), 0, None)
 
 
 if __name__ == "__main__":
-    predict(HERE / "test.csv", HERE / "predictions.csv")
+    test_path = HERE / "test.csv"
+    out_path = HERE / "predictions.csv"
+    
+    df = pd.read_csv(test_path)
+    models = load_models()
+    hours = predict(df, models)
+    
+    out = pd.DataFrame({"project_id": df["project_id"], "hours_spent": hours})
+    out.to_csv(out_path, index=False)
+    print(f"Wrote {len(out)} predictions to {out_path}")
